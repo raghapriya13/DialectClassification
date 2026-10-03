@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Tamil dialect classification with frozen Whisper + MI priors + 5-fold CV.
+Fixed version: loads final_heads_with_mi.pt (module names handcrafted_proj / dialect_heads),
+strict weight loading, and writes test predictions. No change to model/training logic.
 """
 
 import os
@@ -39,6 +41,8 @@ N_FOLDS = 5
 DURATION = 5
 TARGET_SR = 16000
 
+PRED_OUT = 'paper/review/final_predictions.txt'
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
@@ -46,8 +50,8 @@ DIALECT_NAMES = ['Central', 'Northern', 'Southern', 'Western']
 DIALECT_TO_IDX = {name: i for i, name in enumerate(DIALECT_NAMES)}
 IDX_TO_DIALECT = {i: name for i, name in enumerate(DIALECT_NAMES)}
 
-os.makedirs('paper/submission', exist_ok=True)
-os.makedirs('paper/saved_final_model', exist_ok=True)
+os.makedirs('paper/review', exist_ok=True)
+os.makedirs('paper/model_reviewed', exist_ok=True)
 os.makedirs('cv_results', exist_ok=True)
 
 # ==========================================
@@ -226,6 +230,8 @@ class WhisperEncoderWrapper(nn.Module):
 
 # ==========================================
 # DIALECT-SPECIFIC HEADS
+# (module names match checkpoint final_heads_with_mi.pt:
+#  whisper_proj, handcrafted_proj, dialect_heads)
 # ==========================================
 class DialectHeads(nn.Module):
     def __init__(self, whisper_dim=768, hand_dim=26, hidden=128, num_classes=4, dropout=0.3, mi_weights=None):
@@ -241,13 +247,13 @@ class DialectHeads(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        self.hand_proj = nn.Sequential(
+        self.handcrafted_proj = nn.Sequential(
             nn.Linear(hand_dim, hidden//2),
             nn.BatchNorm1d(hidden//2),
             nn.GELU(),
             nn.Dropout(dropout*0.5)
         )
-        self.heads = nn.ModuleList([
+        self.dialect_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden + hidden//2, hidden//2),
                 nn.BatchNorm1d(hidden//2),
@@ -260,10 +266,10 @@ class DialectHeads(nn.Module):
     def forward(self, whisper_feats, hand_feats):
         whisper_out = self.whisper_proj(whisper_feats)
         logits = []
-        for i, head in enumerate(self.heads):
+        for i, head in enumerate(self.dialect_heads):
             weight = self.weights[i].to(hand_feats.device)
             weighted_hand = hand_feats * weight
-            hand_out = self.hand_proj(weighted_hand)
+            hand_out = self.handcrafted_proj(weighted_hand)
             combined = torch.cat([whisper_out, hand_out], dim=1)
             logits.append(head(combined))
         return torch.cat(logits, dim=1)
@@ -369,15 +375,9 @@ def train_fold(train_whisper, train_hand, train_y, val_whisper, val_hand, val_y,
 # MAIN
 # ==========================================
 def main():
-    all_samples = load_all_samples(DATA_PATH)
-    if not all_samples:
-        return
+    MODEL_PATH = "final_heads_with_mi.pt"
 
-    speaker_to_dialect = {s['speaker_id']: s['dialect_idx'] for s in all_samples}
-    speakers = list(speaker_to_dialect.keys())
-    speaker_dialects = [speaker_to_dialect[spk] for spk in speakers]
-
-    # Load frozen Whisper encoder
+    # Load frozen Whisper encoder (needed for both training and inference)
     whisper_model = whisper.load_model(WHISPER_MODEL).to(DEVICE)
     encoder = WhisperEncoderWrapper(whisper_model.encoder)
     for p in encoder.parameters():
@@ -385,101 +385,136 @@ def main():
     encoder.eval()
 
     extractor = FeatureExtractor()
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
-    fold_results = []
-    all_mi_weights = []
+    if os.path.exists(MODEL_PATH):
+        print(f"\nFound saved model at {MODEL_PATH}. Loading and skipping training.")
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+        print("Checkpoint keys:", list(checkpoint.keys()))
+        state = checkpoint.get('heads_state_dict') or checkpoint.get('model_state')
+        if state is None:
+            raise KeyError(f"No weights in checkpoint. Keys: {list(checkpoint.keys())}")
+        model = DialectHeads(whisper_dim=768, hand_dim=HANDCRAFTED_DIM, hidden=HEAD_HIDDEN_DIM,
+                             num_classes=4, dropout=HEAD_DROPOUT,
+                             mi_weights=checkpoint['mi_weights']).to(DEVICE)
+        model.load_state_dict(state, strict=True)   # raises on any mismatch
+        model.eval()
+        print("Model loaded successfully (all keys matched).")
+    else:
+        print("\nNo saved model found. Training from scratch.")
+        all_samples = load_all_samples(DATA_PATH)
+        if not all_samples:
+            return
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(speakers, speaker_dialects)):
-        train_spks = [speakers[i] for i in train_idx]
-        val_spks = [speakers[i] for i in val_idx]
-        train_samples = [s for s in all_samples if s['speaker_id'] in train_spks]
-        val_samples = [s for s in all_samples if s['speaker_id'] in val_spks]
+        speaker_to_dialect = {s['speaker_id']: s['dialect_idx'] for s in all_samples}
+        speakers = list(speaker_to_dialect.keys())
+        speaker_dialects = [speaker_to_dialect[spk] for spk in speakers]
 
-        print(f"\nFold {fold_idx+1}: Train={len(train_samples)}, Val={len(val_samples)}")
+        skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
-        train_hand, train_y = extract_hand(train_samples, extractor)
+        fold_results = []
+        all_mi_weights = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(speakers, speaker_dialects)):
+            train_spks = [speakers[i] for i in train_idx]
+            val_spks = [speakers[i] for i in val_idx]
+            train_samples = [s for s in all_samples if s['speaker_id'] in train_spks]
+            val_samples = [s for s in all_samples if s['speaker_id'] in val_spks]
+
+            print(f"\nFold {fold_idx+1}: Train={len(train_samples)}, Val={len(val_samples)}")
+
+            train_hand, train_y = extract_hand(train_samples, extractor)
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(train_hand)
+
+            # Compute MI weights per dialect
+            mi_weights = []
+            for d in range(4):
+                y_bin = (train_y == d).astype(int)
+                mi = mutual_info_classif(X_train_scaled, y_bin, random_state=RANDOM_SEED)
+                mi_weights.append(mi)
+            all_mi_weights.append(mi_weights)
+
+            train_whisper = extract_whisper(train_samples, encoder, DEVICE)
+            val_whisper = extract_whisper(val_samples, encoder, DEVICE)
+            val_hand, val_y = extract_hand(val_samples, extractor)
+
+            best_f1, best_acc = train_fold(train_whisper, train_hand, train_y,
+                                           val_whisper, val_hand, val_y,
+                                           mi_weights, fold_idx)
+            fold_results.append({'acc': best_acc, 'f1': best_f1})
+            print(f"Fold {fold_idx+1} Result: Acc={best_acc:.4f}, F1={best_f1:.4f}")
+
+        # CV summary
+        accs = [r['acc'] for r in fold_results]
+        f1s = [r['f1'] for r in fold_results]
+        mean_acc, std_acc = np.mean(accs), np.std(accs)
+        mean_f1, std_f1 = np.mean(f1s), np.std(f1s)
+        print(f"\nCV Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
+        print(f"CV Macro F1: {mean_f1:.4f} ± {std_f1:.4f}")
+        with open('cv_results/cv_results.json', 'w') as f:
+            json.dump({'mean_acc': mean_acc, 'std_acc': std_acc,
+                       'mean_f1': mean_f1, 'std_f1': std_f1,
+                       'fold_results': fold_results}, f, indent=2)
+
+        # Final model on all data
+        print("\nTraining final model on all data...")
+        all_hand, all_y = extract_hand(all_samples, extractor)
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(train_hand)
-
-        # Compute MI weights per dialect
-        mi_weights = []
+        X_all_scaled = scaler.fit_transform(all_hand)
+        final_mi = []
         for d in range(4):
-            y_bin = (train_y == d).astype(int)
-            mi = mutual_info_classif(X_train_scaled, y_bin, random_state=RANDOM_SEED)
-            mi_weights.append(mi)
-        all_mi_weights.append(mi_weights)
+            y_bin = (all_y == d).astype(int)
+            mi = mutual_info_classif(X_all_scaled, y_bin, random_state=RANDOM_SEED)
+            final_mi.append(mi)
+        all_whisper = extract_whisper(all_samples, encoder, DEVICE)
 
-        train_whisper = extract_whisper(train_samples, encoder, DEVICE)
-        val_whisper = extract_whisper(val_samples, encoder, DEVICE)
-        val_hand, val_y = extract_hand(val_samples, extractor)
+        # Train final heads (no validation, use full epochs)
+        train_whisper = torch.FloatTensor(all_whisper)
+        train_hand = torch.FloatTensor(all_hand)
+        train_y = torch.LongTensor(all_y)
+        train_loader = DataLoader(TensorDataset(train_whisper, train_hand, train_y),
+                                  batch_size=BATCH_SIZE, shuffle=True)
 
-        best_f1, best_acc = train_fold(train_whisper, train_hand, train_y,
-                                       val_whisper, val_hand, val_y,
-                                       mi_weights, fold_idx)
-        fold_results.append({'acc': best_acc, 'f1': best_f1})
-        print(f"Fold {fold_idx+1} Result: Acc={best_acc:.4f}, F1={best_f1:.4f}")
+        model = DialectHeads(whisper_dim=768, hand_dim=HANDCRAFTED_DIM, hidden=HEAD_HIDDEN_DIM,
+                             num_classes=4, dropout=HEAD_DROPOUT, mi_weights=final_mi).to(DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+        criterion = nn.CrossEntropyLoss()
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
-    # CV summary
-    accs = [r['acc'] for r in fold_results]
-    f1s = [r['f1'] for r in fold_results]
-    mean_acc, std_acc = np.mean(accs), np.std(accs)
-    mean_f1, std_f1 = np.mean(f1s), np.std(f1s)
-    print(f"\nCV Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-    print(f"CV Macro F1: {mean_f1:.4f} ± {std_f1:.4f}")
-    with open('cv_results/cv_results.json', 'w') as f:
-        json.dump({'mean_acc': mean_acc, 'std_acc': std_acc,
-                   'mean_f1': mean_f1, 'std_f1': std_f1,
-                   'fold_results': fold_results}, f, indent=2)
+        for epoch in range(NUM_EPOCHS):
+            model.train()
+            total_loss, correct, total = 0, 0, 0
+            for w, h, y in tqdm(train_loader, desc=f"Final Epoch {epoch+1}"):
+                w, h, y = w.to(DEVICE), h.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                logits = model(w, h)
+                loss = criterion(logits, y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                _, pred = torch.max(logits, 1)
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+            scheduler.step()
+            print(f"Epoch {epoch+1} train acc: {correct/total:.4f}")
 
-    # Final model on all data
-    print("\nTraining final model on all data...")
-    all_hand, all_y = extract_hand(all_samples, extractor)
-    scaler = StandardScaler()
-    X_all_scaled = scaler.fit_transform(all_hand)
-    final_mi = []
-    for d in range(4):
-        y_bin = (all_y == d).astype(int)
-        mi = mutual_info_classif(X_all_scaled, y_bin, random_state=RANDOM_SEED)
-        final_mi.append(mi)
-    all_whisper = extract_whisper(all_samples, encoder, DEVICE)
+        # Save final model
+        torch.save({
+            'model_state': model.state_dict(),
+            'mi_weights': final_mi,
+            'feature_names': ENHANCED_FEATURES,
+            'dialect_names': DIALECT_NAMES
+        }, MODEL_PATH)
+        print(f"Final model saved to {MODEL_PATH}")
 
-    # Train final heads (no validation, use full epochs)
-    train_whisper = torch.FloatTensor(all_whisper)
-    train_hand = torch.FloatTensor(all_hand)
-    train_y = torch.LongTensor(all_y)
-    train_loader = DataLoader(TensorDataset(train_whisper, train_hand, train_y),
-                              batch_size=BATCH_SIZE, shuffle=True)
-
-    model = DialectHeads(whisper_dim=768, hand_dim=HANDCRAFTED_DIM, hidden=HEAD_HIDDEN_DIM,
-                         num_classes=4, dropout=HEAD_DROPOUT, mi_weights=final_mi).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        total_loss, correct, total = 0, 0, 0
-        for w, h, y in tqdm(train_loader, desc=f"Final Epoch {epoch+1}"):
-            w, h, y = w.to(DEVICE), h.to(DEVICE), y.to(DEVICE)
-            optimizer.zero_grad()
-            logits = model(w, h)
-            loss = criterion(logits, y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
-            _, pred = torch.max(logits, 1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        scheduler.step()
-        print(f"Epoch {epoch+1} train acc: {correct/total:.4f}")
-
-    # Predict test set
+    # ==========================================
+    # Test set prediction (runs regardless of whether model was loaded or trained)
+    # ==========================================
     test_path = os.path.join(DATA_PATH, 'Test')
     if os.path.exists(test_path):
         test_files = sorted([os.path.join(test_path, f) for f in os.listdir(test_path) if f.endswith('.wav')])
-        print(f"Predicting {len(test_files)} test files...")
+        print(f"\nPredicting {len(test_files)} test files...")
         test_hand_list, test_whisper_list, test_ids = [], [], []
         for path in tqdm(test_files):
             fid = os.path.splitext(os.path.basename(path))[0]
@@ -518,19 +553,12 @@ def main():
                 preds.extend(pred.cpu().numpy())
 
         # Save predictions
-        with open('paper/submission/final_predictions.txt', 'w') as f:
+        with open(PRED_OUT, 'w') as f:
             for fid, p in zip(test_ids, preds):
                 f.write(f"{fid} {IDX_TO_DIALECT[p]}\n")
-        print(f"Predictions saved to paper/submission/final_predictions.txt")
-
-        # Save final model
-        torch.save({
-            'model_state': model.state_dict(),
-            'mi_weights': final_mi,
-            'feature_names': ENHANCED_FEATURES,
-            'dialect_names': DIALECT_NAMES
-        }, 'paper/saved_final_model/final_model.pt')
-        print("Final model saved to paper/saved_final_model/final_model.pt")
+        print(f"Predictions saved to {PRED_OUT}")
+    else:
+        print(f"Test path {test_path} not found. Skipping prediction.")
 
 if __name__ == "__main__":
     main()
